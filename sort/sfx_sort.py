@@ -15,17 +15,21 @@ Already-organized parts of the library are never touched.
 No third-party packages needed (Python 3.11+, or 3.8+ with `tomli`).
 
 Usage:
-  sfx_sort.py                 sort now
-  sfx_sort.py --dry-run       show what would happen, move nothing
-  sfx_sort.py --undo FILE     reverse a previous run using its journal (logs/moves-*.tsv)
-  sfx_sort.py --config PATH   use another config file
+  sfx_sort.py --library PATH          sort now (or set the library once, see below)
+  sfx_sort.py --dry-run               show what would happen, move nothing
+  sfx_sort.py --undo FILE             reverse a previous run using its journal (logs/moves-*.tsv)
+  sfx_sort.py --init [--library PATH] write a default sfx_sort.toml (add --force to replace one)
+  sfx_sort.py --set-library PATH      save the library path in the config
+  sfx_sort.py --config PATH           use another config file (or set SFX_SORT_CONFIG)
+
+Library path, highest priority first: --library, $SFX_LIBRARY, `library` in the config.
+Runs on Linux, macOS and Windows; no config file is needed if --library is given.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
-import fcntl
 import hashlib
 import os
 import re
@@ -45,6 +49,173 @@ except ModuleNotFoundError:  # pragma: no cover
         sys.exit("sfx_sort: needs Python 3.11+, or `pip install tomli` on older Pythons (setup.sh handles this).")
 
 HERE = Path(__file__).resolve().parent
+DEFAULT_CONFIG_PATH = HERE / "sfx_sort.toml"
+
+DEFAULT_CONFIG = r'''# sfx_sort configuration
+# Relative paths are resolved against the folder this file lives in.
+
+# Path to the SFX library. Can be overridden per run with --library or the
+# SFX_LIBRARY environment variable. Set it with:  sfx_sort.py --set-library PATH
+library = ""
+
+# Folders (relative to the library) that the sorter empties out each run.
+# Everything else in the library is treated as already organized and is never touched.
+inboxes = ["_Inbox", "SoundlyAudio"]
+
+review_dir     = "_Review"      # anything the sorter can't place confidently
+duplicates_dir = "_Duplicates"  # byte-identical copies (never deleted, only moved here)
+log_dir        = "logs"         # relative to sound_utils/
+
+# Optional: path to the official UCS spreadsheet exported as CSV
+# (needs columns named "CatID" and "Category", optionally "SubCategory").
+# Leave empty to use the built-in category prefix table.
+ucs_csv = ""
+
+# Subfolder inside the destination category folder. Placeholders:
+#   {ucs_category} {ucs_subcategory} {inbox}
+# "" drops loose files straight into the category folder (matches the current layout).
+dest_subfolder = ""
+
+min_age_minutes   = 30     # skip files modified recently (they may still be copying)
+dedupe            = true   # detect byte-identical copies
+dedupe_library    = true   # ...also against files already in the library (size check first, then hash)
+pack_min_agreement = 0.6   # share of a pack's files that must agree before the whole pack is moved
+orphan_sidecars   = "leave"  # "leave" or "review": peak files whose audio file is gone
+
+audio_ext   = [".wav", ".aif", ".aiff", ".flac", ".mp3", ".ogg", ".m4a", ".bwf", ".w64", ".caf"]
+sidecar_ext = [".pkf", ".reapeaks", ".asd", ".sfk", ".peak", ".ovw", ".pk"]
+ignore_names = ["_wfCache", "_temp", ".DS_Store", "Thumbs.db", "desktop.ini"]
+
+# UCS category (full name, upper case) -> library folder.
+# Folders that don't exist yet are created on first use.
+[ucs_category_to_folder]
+"AIR" = "Industry"
+"AIRCRAFT" = "Transportation"
+"ALARMS" = "Emergency Effects"
+"AMBIENCE" = "Ambience"
+"ANIMALS" = "Animals"
+"ARCHIVED" = "_Review"
+"BEEPS" = "UI"
+"BELLS" = "Foley"
+"BIRDS" = "Animals"
+"BOATS" = "Transportation"
+"BULLETS" = "Weapons"
+"CARTOON" = "Cartoon"
+"CERAMICS" = "Foley"
+"CHAINS" = "Foley"
+"CHEMICALS" = "Foley"
+"CLOCKS" = "Household"
+"CLOTH" = "Foley"
+"COMMUNICATIONS" = "Technology"
+"COMPUTERS" = "Technology"
+"CRASHES" = "Crashes"
+"CREATURES" = "Creature"
+"CROWDS" = "Human Elements"
+"DESIGNED" = "Production Elements"
+"DESTRUCTION" = "Destruction"
+"DIRT & SAND" = "Foley"
+"DOORS" = "Household"
+"DRAWERS" = "Household"
+"ELECTRICITY" = "Technology"
+"EQUIPMENT" = "Foley"
+"EXPLOSIONS" = "Destruction"
+"FARTS" = "Cartoon"
+"FIGHT" = "Impacts"
+"FIRE" = "Physics"
+"FIREWORKS" = "Destruction"
+"FOLEY" = "Foley"
+"FOOD & DRINK" = "Household"
+"FOOTSTEPS" = "Footsteps"
+"FURNITURE" = "Household"
+"GAMES" = "Multimedia"
+"GEOTHERMAL" = "Physics"
+"GLASS" = "Foley"
+"GORE" = "Horror"
+"GUNS" = "Weapons"
+"HORNS" = "Transportation"
+"HUMAN" = "Human Elements"
+"ICE" = "Weather"
+"LASERS" = "Sci-Fi"
+"LEATHER" = "Foley"
+"LIQUID & MUD" = "Liquid-Water"
+"MACHINES" = "Industry"
+"MAGIC" = "Magic"
+"MECHANICAL" = "Industry"
+"METAL" = "Foley"
+"MOTORS" = "Industry"
+"MOVEMENT" = "Foley"
+"MUSICAL" = "Music"
+"NATURAL DISASTER" = "Weather"
+"OBJECTS" = "Foley"
+"PAPER" = "Foley"
+"PLASTIC" = "Foley"
+"RAIN" = "Weather"
+"ROBOTS" = "Sci-Fi"
+"ROCKS" = "Foley"
+"ROPE" = "Foley"
+"RUBBER" = "Foley"
+"SCIFI" = "Sci-Fi"
+"SNOW" = "Weather"
+"SPORTS" = "Sports"
+"SWITCHES" = "Household"
+"SWOOSHES" = "Production Elements"
+"TOOLS" = "Foley"
+"TOYS" = "Foley"
+"TRAINS" = "Transportation"
+"USER INTERFACE" = "UI"
+"VEGETATION" = "Foley"
+"VEHICLES" = "Vehicles"
+"VOICES" = "Human Elements"
+"WATER" = "Liquid-Water"
+"WEAPONS" = "Weapons"
+"WEATHER" = "Weather"
+"WHOOSHES" = "Production Elements"
+"WIND" = "Weather"
+"WINDOWS" = "Household"
+"WINGS" = "Animals"
+"WOOD" = "Foley"
+
+# Exact CatIDs that should go somewhere other than their category's folder.
+[catid_overrides]
+"WATRUndwtr" = "Underwater"
+"AMBUndwtr"  = "Underwater"
+
+# Non-UCS files: keywords per folder (whole words, case-insensitive).
+# A match on the FIRST word(s) of the filename counts 3, anywhere else 1.
+# The top folder must score >= 2 and beat the runner-up by >= 1, otherwise -> review.
+[keywords]
+"Ambience" = ["ambience", "ambiences", "ambient", "amb", "atmos", "atmosphere", "roomtone", "room tone", "background"]
+"Animals" = ["animal", "animals", "bird", "birds", "dog", "dogs", "cat", "cats", "horse", "horses", "insect", "insects", "cow", "pig", "sheep", "wolf", "lion", "frog", "owl", "chicken"]
+"Cartoon" = ["cartoon", "cartoons", "toon", "toons", "boing", "slide whistle"]
+"Crashes" = ["crash", "crashes"]
+"Creature" = ["creature", "creatures", "monster", "monsters", "dinosaur"]
+"Destruction" = ["destruction", "explosion", "explosions", "debris", "collapse", "demolition"]
+"Drones" = ["drone", "drones"]
+"DTMF" = ["dtmf"]
+"Emergency Effects" = ["emergency", "siren", "sirens", "police", "ambulance", "dispatch", "alarm", "alarms"]
+"Foley" = ["foley", "cloth", "rustle", "zipper", "objects", "object", "handling"]
+"Footsteps" = ["footstep", "footsteps", "steps", "walking", "running"]
+"Horror" = ["horror", "scary", "creepy", "haunted"]
+"Household" = ["household", "kitchen", "door", "doors", "drawer", "appliance", "appliances"]
+"Human Elements" = ["human", "voice", "voices", "vox", "breath", "breathing", "laugh", "scream", "crowd", "crowds", "walla", "cough"]
+"Impacts" = ["impact", "impacts", "hit", "hits", "punch", "punches"]
+"Industry" = ["industry", "industrial", "factory", "machine", "machinery"]
+"Liquid-Water" = ["water", "liquid", "splash", "pour", "drip", "drips", "bubbles"]
+"Magic" = ["magic", "spell", "spells", "fantasy"]
+"Music" = ["music", "musical", "instrument"]
+"Noise" = ["noise", "white noise", "pink noise"]
+"Production Elements" = ["whoosh", "whooshes", "swoosh", "riser", "risers", "transition", "stinger"]
+"Sci-Fi" = ["sci-fi", "scifi", "science fiction", "spaceship", "laser", "futuristic", "robot"]
+"Sports" = ["sport", "sports", "stadium", "basketball", "football", "baseball"]
+"Technology" = ["technology", "computer", "electric", "electricity", "electronic", "phone"]
+"Tones" = ["tone", "tones", "sine", "beep", "beeps"]
+"Transportation" = ["transportation", "train", "trains", "plane", "aircraft", "airplane", "boat", "ship", "subway"]
+"UI" = ["ui", "interface", "click", "button", "menu"]
+"Underwater" = ["underwater"]
+"Vehicles" = ["vehicle", "vehicles", "car", "cars", "truck", "motorcycle", "engine"]
+"Weapons" = ["weapon", "weapons", "gun", "guns", "rifle", "pistol", "bullet", "bullets", "sword", "cannon", "shotgun"]
+"Weather" = ["weather", "rain", "wind", "thunder", "storm", "snow", "hail"]
+'''
 
 # Built-in UCS category prefixes -> full category names. Used when no ucs_csv is configured.
 UCS_PREFIXES = {
@@ -74,16 +245,31 @@ DUP_SUFFIX_RE = re.compile(r" \d+$")
 
 # --------------------------------------------------------------------------- config
 class Config:
-    def __init__(self, path: Path):
-        with open(path, "rb") as f:
-            c = tomllib.load(f)
+    def __init__(self, path: Path, library_override: str | None = None, require_library: bool = True):
+        if path.is_file():
+            with open(path, "rb") as f:
+                c = tomllib.load(f)
+        else:  # no config file: run on the built-in defaults
+            c = tomllib.loads(DEFAULT_CONFIG)
         base = path.resolve().parent
-        rel = lambda p: (base / p).resolve() if not os.path.isabs(p) else Path(p)
-        self.library = rel(c.get("library", "../sound_library"))
+        rel = lambda p: Path(os.path.expanduser(p)) if os.path.isabs(os.path.expanduser(p)) else (base / p).resolve()
+        if library_override:
+            lib = Path(os.path.expanduser(library_override)).resolve()
+        elif c.get("library"):
+            lib = rel(c["library"])
+        elif not require_library:
+            lib = Path(".")
+        else:
+            sys.exit("sfx_sort: no library folder given. Use --library PATH, set SFX_LIBRARY, "
+                     "or save it with: sfx_sort.py --set-library PATH")
+        self.library = lib
+        if require_library and not lib.is_dir():
+            sys.exit(f"sfx_sort: library folder not found: {lib}")
         self.inboxes = list(c.get("inboxes", ["_Inbox"]))
         self.review_dir = c.get("review_dir", "_Review")
         self.duplicates_dir = c.get("duplicates_dir", "_Duplicates")
         self.log_dir = rel(c.get("log_dir", "logs"))
+        self.lock_path = self.log_dir / ".sfx_sort.lock"
         self.dest_subfolder = c.get("dest_subfolder", "")
         self.min_age = float(c.get("min_age_minutes", 30)) * 60
         self.dedupe = bool(c.get("dedupe", True))
@@ -533,23 +719,101 @@ def undo(journal: Path, dry: bool):
     print(f"undo: {done} restored{' (dry run)' if dry else ''}")
 
 
+# --------------------------------------------------------------------------- lock (cross-platform)
+def acquire_lock(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("sfx_sort: another run is in progress")
+    return fh  # keep open for the life of the process
+
+
+# --------------------------------------------------------------------------- config file helpers
+def library_line(path: str) -> str:
+    # TOML literal string: no escaping needed for backslashes (Windows paths)
+    if "'" in path:
+        return 'library = "' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return f"library = '{path}'"
+
+
+def init_config(cfg_path: Path, library: str | None, force: bool):
+    old_lib = None
+    if cfg_path.exists():
+        if not force:
+            sys.exit(f"sfx_sort: {cfg_path} already exists (use --force to replace it; a backup is kept)")
+        try:
+            old_lib = tomllib.loads(cfg_path.read_text(encoding="utf-8")).get("library") or None
+        except Exception:
+            pass
+        backup = cfg_path.with_name(cfg_path.name + ".bak." + dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(cfg_path, backup)
+        print(f"backed up old config to {backup}")
+    text = DEFAULT_CONFIG
+    lib = library or old_lib
+    if lib:
+        text = re.sub(r'(?m)^library = .*$', lambda _: library_line(str(resolve_library_arg(lib))), text, count=1)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(text, encoding="utf-8")
+    print(f"wrote {cfg_path}")
+
+
+def resolve_library_arg(p: str) -> Path:
+    path = Path(os.path.expanduser(p)).resolve()
+    if not path.is_dir():
+        sys.exit(f"sfx_sort: library folder not found: {path}")
+    return path
+
+
+def set_library(cfg_path: Path, library: str):
+    lib = resolve_library_arg(library)
+    if not cfg_path.exists():
+        return init_config(cfg_path, str(lib), False)
+    text = cfg_path.read_text(encoding="utf-8")
+    line = library_line(str(lib))
+    text, n = re.subn(r'(?m)^library\s*=.*$', lambda _: line, text, count=1)
+    if not n:
+        text = line + "\n" + text
+    tomllib.loads(text)  # make sure we didn't break it
+    cfg_path.write_text(text, encoding="utf-8")
+    print(f"library set to {lib} in {cfg_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", type=Path, default=HERE / "sfx_sort.toml")
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--library", "-l", metavar="PATH", help="SFX library folder (overrides config and $SFX_LIBRARY)")
+    ap.add_argument("--config", type=Path, default=Path(os.environ.get("SFX_SORT_CONFIG", DEFAULT_CONFIG_PATH)))
+    ap.add_argument("--dry-run", "-n", action="store_true")
     ap.add_argument("--undo", type=Path, metavar="JOURNAL")
+    ap.add_argument("--init", action="store_true", help="write a default config file")
+    ap.add_argument("--force", action="store_true", help="with --init: replace an existing config")
+    ap.add_argument("--set-library", metavar="PATH", help="save the library path in the config")
     args = ap.parse_args()
 
-    lock = open(HERE / ".sfx_sort.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        sys.exit("sfx_sort: another run is in progress")
+    if args.init:
+        return init_config(args.config, args.library, args.force)
+    if args.set_library:
+        return set_library(args.config, args.set_library)
 
+    library = args.library or os.environ.get("SFX_LIBRARY") or None
+    cfg = Config(args.config, library, require_library=not args.undo)
+    lock = acquire_lock(cfg.lock_path)  # noqa: F841
     if args.undo:
         return undo(args.undo, args.dry_run)
-    Sorter(Config(args.config), args.dry_run).run()
+    Sorter(cfg, args.dry_run).run()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:  # output piped into `head` etc.
+        sys.stderr.close()
+    except KeyboardInterrupt:
+        sys.exit(130)

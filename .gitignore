@@ -221,3 +221,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# sfx_sort (generated on each machine by sort/setup.sh)
+sort/sfx_sort.toml
+sort/sfx_sort.toml.bak.*
+sort/logs/
+sort/.sfx_sort.lock
+sort/.cron.lock
