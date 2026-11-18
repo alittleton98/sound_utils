@@ -1,4 +1,4 @@
-# sfx_sort
+# SFX Sort
 
 Weekly sorter for an SFX library. It empties the inbox folders (`_Inbox`, `SoundlyAudio` by default)
 into the library's category folders and never touches anything that's already filed.
